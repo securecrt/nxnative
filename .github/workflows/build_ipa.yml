@@ -1,0 +1,203 @@
+name: build-ipa
+
+on:
+  workflow_dispatch:
+    inputs:
+      game_file:
+        description: "Game zip file name"
+        required: true
+      language:
+        description: "Game language"
+        required: false
+        default: "zh-Hans"
+      app_name:
+        description: "App name"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ipa
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build IPA on macOS runner
+    runs-on: macos-26
+    timeout-minutes: 350
+
+    env:
+      NSP_URL: ${{ secrets.NSP_URL }}
+      KEYS_URL: ${{ secrets.KEYS_URL }}
+      NSP_USER: ${{ secrets.NSP_USER }}
+      NSP_PASS: ${{ secrets.NSP_PASS }}
+      IPA_UPLOAD_URL: ${{ secrets.IPA_UPLOAD_URL }}
+      UPLOAD_USER: ${{ secrets.UPLOAD_USER }}
+      UPLOAD_PASS: ${{ secrets.UPLOAD_PASS }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check secrets are set
+        run: |
+          set -e
+          missing=0
+          for v in NSP_URL KEYS_URL NSP_USER NSP_PASS IPA_UPLOAD_URL UPLOAD_USER UPLOAD_PASS; do
+            val="$(printenv "$v" || true)"
+            if [ -z "$val" ]; then echo "::error::Secret $v is not set"; missing=1; fi
+          done
+          [ "$missing" = 0 ] || exit 1
+          df -h
+          xcodebuild -version || true
+          python3 --version
+
+      - name: Setup Python 3.14
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.14'
+
+      - name: Install Python packages
+        run: |
+          set -eu
+          python -m pip install lz4 capstone fonttools nsz
+          python -c "import sys; print(sys.version)"
+
+      - name: Install missing brew tools
+        run: |
+          set -eu
+          for pair in "xcodegen:xcodegen" "spirv-cross:spirv-cross" "glslangValidator:glslang" "zstd:zstd"; do
+            bin="${pair%%:*}"; formula="${pair##*:}"
+            if command -v "$bin" >/dev/null 2>&1; then
+              echo "$bin already present: $(command -v "$bin")"
+            else
+              echo "Installing $formula ..."
+              brew install "$formula"
+            fi
+          done
+          xcodegen --version
+          command -v spirv-cross
+          glslangValidator --version
+          zstd --version
+
+      - name: Verify preinstalled dotnet and Xcode
+        run: |
+          set -eu
+          sdks="$(dotnet --list-sdks)"
+          echo "$sdks"
+          echo "$sdks" | grep -q '^10\.' || { echo "::error::No .NET SDK 10 found"; exit 1; }
+          base="$(echo "$sdks" | grep '^10\.' | head -n1 | sed -n 's/.*\[\([^]]*\)\].*/\1/p')"
+          root="$(dirname "$base")"
+          echo "dotnet root: $root"
+          test -d "$root/shared/Microsoft.NETCore.App"
+          echo "DOTNET_ROOT=$root" >> "$GITHUB_ENV"
+          echo "DOTNET_ROOT_ARM64=$root" >> "$GITHUB_ENV"
+          xcodebuild -version
+
+      - name: Download game files
+        env:
+          GAME_FILE: ${{ inputs.game_file }}
+        run: |
+          set -eu
+          retry_once() { "$@" || { echo "Transfer failed; retrying the whole transfer once in 10s"; sleep 10; "$@"; }; }
+          name="$(python3 -c 'import sys; print(sys.argv[1].strip())' "$GAME_FILE")"
+          if [ -z "$name" ]; then echo "::error::game_file is required"; exit 1; fi
+          base="$NSP_URL"
+          case "$base" in
+            *.zip) base="${base%/*}" ;;
+          esac
+          base="${base%/}"
+          if [ -z "$base" ]; then echo "::error::NSP_URL must be the rom directory URL"; exit 1; fi
+          enc="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$name")"
+          url="${base}/${enc}"
+          echo "game_file: $name"
+          mkdir -p "$RUNNER_TEMP/game_dl" "$RUNNER_TEMP/keys"
+          retry_once curl -g --fail --location --retry 3 --retry-all-errors \
+               --user "$NSP_USER:$NSP_PASS" \
+               --output "$RUNNER_TEMP/game_dl/game.zip" "$url"
+          retry_once curl -g --fail --location --retry 3 --retry-all-errors \
+               --user "$NSP_USER:$NSP_PASS" \
+               --output "$RUNNER_TEMP/keys/prod.keys" "$KEYS_URL"
+          ls -lh "$RUNNER_TEMP/game_dl" "$RUNNER_TEMP/keys"
+          test -s "$RUNNER_TEMP/keys/prod.keys"
+          df -h
+
+      - name: Unpack game files
+        id: unpack
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/game_src"
+          ditto -x -k "$RUNNER_TEMP/game_dl/game.zip" "$RUNNER_TEMP/game_src"
+          rm -f "$RUNNER_TEMP/game_dl/game.zip"
+          game_dir="$(find "$RUNNER_TEMP/game_src" -type f \( -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \) -print0 | xargs -0 -n1 dirname | sort -u | head -n1)"
+          if [ -z "$game_dir" ]; then
+            echo "::error::No .nsp/.xci/.nsz/.xcz found in the zip"
+            find "$RUNNER_TEMP/game_src" | head -n 100
+            exit 1
+          fi
+          echo "GAME_DIR=$game_dir" >> "$GITHUB_ENV"
+          ls -lh "$game_dir"
+          df -h
+
+      - name: Build IPA
+        run: |
+          set -e
+          extra=""
+          if [ -n "${{ inputs.language }}" ]; then extra="$extra -l ${{ inputs.language }}"; fi
+          if [ -n "${{ inputs.app_name }}" ]; then extra="$extra --app-name '${{ inputs.app_name }}'"; fi
+          eval "python scripts/build_ipa_from_nsp.py \"$GAME_DIR\" -k \"$RUNNER_TEMP/keys/prod.keys\" --no-keep-extracted $extra"
+          df -h
+
+      - name: Upload IPA
+        run: |
+          set -eu
+          retry_once() { "$@" || { echo "Transfer failed; retrying the whole transfer once in 10s"; sleep 10; "$@"; }; }
+          ipa="$(find "$GAME_DIR" -maxdepth 3 -iname '*.ipa' | head -n1)"
+          if [ -z "$ipa" ]; then echo "::error::Build finished but no .ipa found"; find "$GAME_DIR" -maxdepth 3 | head -n 100; exit 1; fi
+          name="$(basename "$ipa")"
+          ls -lh "$ipa"
+          shasum -a 256 "$ipa" | tee "$RUNNER_TEMP/ipa.sha256"
+          enc_name="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$name")"
+          size="$(stat -f %z "$ipa")"
+          if [ "$size" -gt 1000000000 ]; then
+            mkdir -p "$RUNNER_TEMP/parts"
+            split -b 1000m "$ipa" "$RUNNER_TEMP/parts/${name}.part_"
+            pids=""
+            for p in "$RUNNER_TEMP/parts/"*; do
+              pn="$(basename "$p")"
+              enc_pn="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$pn")"
+              ( retry_once curl -g --fail --location --retry 3 \
+                   --user "$UPLOAD_USER:$UPLOAD_PASS" \
+                   --upload-file "$p" "${IPA_UPLOAD_URL}${enc_pn}" ) &
+              pids="$pids $!"
+            done
+            fail=0
+            for pid in $pids; do wait "$pid" || fail=1; done
+            if [ "$fail" != 0 ]; then echo "::error::One or more part uploads failed"; exit 1; fi
+          else
+            retry_once curl -g --fail --location --retry 3 \
+                 --user "$UPLOAD_USER:$UPLOAD_PASS" \
+                 --upload-file "$ipa" "${IPA_UPLOAD_URL}${enc_name}"
+          fi
+          retry_once curl -g --fail --location --retry 3 \
+               --user "$UPLOAD_USER:$UPLOAD_PASS" \
+               --upload-file "$RUNNER_TEMP/ipa.sha256" "${IPA_UPLOAD_URL}${enc_name}.sha256"
+          echo "Uploaded: $name"
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            ${{ env.GAME_DIR }}/*_build/logs
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Cleanup keys
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/keys" "$RUNNER_TEMP/game_src" || true
